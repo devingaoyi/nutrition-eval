@@ -1,13 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import difflib
 
 # ----------------------------------------------------------------
 # 1. 页面全局配置与安全盾牌样式定义
 # ----------------------------------------------------------------
 st.set_page_config(page_title="循证营养品深度评估系统", layout="centered")
 
-# 强制注入全局免责声明
 st.markdown("""
 > ⚠️ **医学免责声明：** 本系统提供的数据均基于公开的临床循证医学文献（如 PubMed）提取。
 > 评估结果仅供科学科普与膳食参考，**不构成任何医疗建议或疾病治疗方案**。
@@ -16,7 +16,7 @@ st.markdown("""
 st.write("---")
 
 # ----------------------------------------------------------------
-# 2. 内存数据加载模块 (利用缓存确保高并发访问性能)
+# 2. 内存数据加载模块 (位置解耦设计：彻底免疫Excel表头文字错误)
 # ----------------------------------------------------------------
 @st.cache_data
 def load_and_clean_data():
@@ -26,7 +26,13 @@ def load_and_clean_data():
         df_deb = pd.read_excel("debunking_statements.xlsx")
         df_prod = pd.read_excel("products.xlsx")
         
-        # 统一清洗文本前后的隐藏空格
+        # 强制基于列的物理位置进行重命名，完全忽略用户在Excel第一行填写的任何文本
+        df_ing.columns = ['中文标准名', '英文标准名', '是否为化合物形态', '折算系数', '每日安全上限(UL)', '单位'][:len(df_ing.columns)]
+        df_evi.columns = ['所属成分(中文名)', '学术健康效果', '临床起效量', '临床最大推荐量', '科学共识陈述(给用户的结论)'][:len(df_evi.columns)]
+        df_deb.columns = ['所属成分(中文名)', '商家夸大话术/伪功效', '触发打假的关键词', '科学驳斥陈述(给用户的警示)'][:len(df_deb.columns)]
+        df_prod.columns = ['品牌名', '商品官方全称', '搜索别名(逗号隔开)', '每日建议服用几粒', '包含的成分(对应表1中文名)', '单粒原料投料量'][:len(df_prod.columns)]
+        
+        # 统一清洗所有文本型单元格的前后隐藏空格
         for df in [df_ing, df_evi, df_deb, df_prod]:
             for col in df.select_dtypes(include=['object']).columns:
                 df[col] = df[col].astype(str).str.strip()
@@ -41,32 +47,25 @@ df_ing, df_evi, df_deb, df_prod = load_and_clean_data()
 # 3. 核心四段式算法处理引擎
 # ----------------------------------------------------------------
 def execute_evaluation_engine(ing_name, raw_dose, servings):
-    """根据输入的成分、投料量、频次进行四段式判定并渲染视图"""
-    # 查找成分基础参数
     ing_meta = df_ing[df_ing["中文标准名"] == ing_name]
     if ing_meta.empty:
         st.error(f"成分库中未找到标准名称为 【{ing_name}】 的记录。")
         return
 
-    # 提取物理参数
     factor = float(ing_meta["折算系数"].values[0])
     unit = str(ing_meta["单位"].values[0])
     ul_val = ing_meta["每日安全上限(UL)"].values[0]
-    upper_limit = float(ul_val) if pd.notna(ul_val) and str(ul_val) != "无" else float('inf')
+    upper_limit = float(ul_val) if pd.notna(ul_val) and str(ul_val) != "无" and str(ul_val) != "nan" else float('inf')
 
-    # 计算每日实际活性物质摄入量
     daily_intake = float(raw_dose) * float(servings) * factor
 
     st.subheader(f"📊 成分评估看板: {ing_name}")
     st.write(f"实际计算结果：每日活性物质总摄入量约为 **{daily_intake:.2f} {unit}**")
 
-    # 1. 触发最高安全红线判定 (区间 4)
     if daily_intake > upper_limit:
         st.error(f"🚨 毒性与超量危险：当前剂量已超过国家推荐的每日最高耐受上限（UL: {upper_limit} {unit}）。长期连续服用存在明确的肝肾损伤等潜在不良副反应风险，建议立刻停止服用。")
     
-    # 读取该成分对应的真实功效库
     evidence_rows = df_evi[df_evi["所属成分(中文名)"] == ing_name]
-    
     if not evidence_rows.empty:
         st.markdown("### 🟢 循证医学·真实科学功效")
         for _, row in evidence_rows.iterrows():
@@ -75,7 +74,6 @@ def execute_evaluation_engine(ing_name, raw_dose, servings):
             goal = row["学术健康效果"]
             consensus = row["科学共识陈述(给用户的结论)"]
 
-            # 区间 1、2、3 状态机划定
             if daily_intake < min_eff:
                 status_text = "⚠️ 剂量不足"
                 status_color = "orange"
@@ -89,8 +87,7 @@ def execute_evaluation_engine(ing_name, raw_dose, servings):
                 status_color = "blue"
                 desc = "当前剂量已超过常规膳食推荐区间，属于临床高强度干预剂量，普通人不建议长期无医嘱维持。"
 
-            # 视图渲染
-            with st.expander(f"{goal} (证据等级计算中) - :{status_color}[{status_text}]"):
+            with st.expander(f"{goal} - :{status_color}[{status_text}]"):
                 st.write(f"**临床推荐有效区间：** {min_eff} - {max_eff} {unit}")
                 st.write(f"**状态评估：** {desc}")
                 st.write(f"**科学共识：** {consensus}")
@@ -103,11 +100,10 @@ def execute_evaluation_engine(ing_name, raw_dose, servings):
             claim = row["商家夸大话术/伪功效"]
             refutation = row["科学驳斥陈述(给用户的警示)"]
             
-            with st.error_exception if hasattr(st, "error_exception") else st.container():
-                st.markdown(f"❌ **商家宣称伪功效：** *{claim}*")
-                st.markdown(f"🧬 **证据级别：** `E 级 (无人类临床证据 / 商业纯粹夸大)`")
-                st.markdown(f"💡 **循证医学驳斥：** {refutation}")
-                st.write("---")
+            st.markdown(f"❌ **商家宣称伪功效：** *{claim}*")
+            st.markdown(f"🧬 **证据级别：** `E 级 (无人类临床证据 / 商业纯粹夸大)`")
+            st.markdown(f"💡 **循证医学驳斥：** {refutation}")
+            st.write("---")
     else:
         st.info("💡 提示：暂未发现该成分在市面上有高频、大规模的违规夸大营销话术。")
 
@@ -115,7 +111,6 @@ def execute_evaluation_engine(ing_name, raw_dose, servings):
 # 4. 前端交互视图控制中心
 # ----------------------------------------------------------------
 if df_ing is not None:
-    # 侧边栏模式切换器
     mode = st.sidebar.radio("选择查询模式", ["商品名称搜索", "手动拆解成分评估"])
 
     if mode == "商品名称搜索":
@@ -123,7 +118,6 @@ if df_ing is not None:
         search_input = st.text_input("请输入您想查询的营养品商品全称或别名", placeholder="如: 斯维诗大蓟水飞蓟护肝片")
         
         if search_input:
-            # 在商品表中执行关键词匹配（官方名称或别名）
             matched_rows = df_prod[
                 df_prod["商品官方全称"].str.contains(search_input, case=False, na=False) |
                 df_prod["搜索别名(逗号隔开)"].str.contains(search_input, case=False, na=False)
@@ -131,7 +125,6 @@ if df_ing is not None:
             
             if not matched_rows.empty:
                 st.success(f"成功在白名单库中检索到该商品，正在解析其配方构成...")
-                # 一款产品可能有多个成分行（复合配方），循环处理
                 for _, p_row in matched_rows.iterrows():
                     p_name = p_row["商品官方全称"]
                     brand = p_row["品牌名"]
@@ -148,10 +141,7 @@ if df_ing is not None:
         st.markdown("### 🧪 手动成分反向拆解")
         st.write("请对照您手里营养品瓶身背面的成分表（Supplement Facts）进行选择：")
         
-        # 下拉菜单强制限定范围
         selected_ing = st.selectbox("1. 请选择您要评估的活性成分", df_ing["中文标准名"].tolist())
-        
-        # 获取当前选择成分的单位用于动态标签呈现
         current_unit = df_ing[df_ing["中文标准名"] == selected_ing]["单位"].values[0]
         
         input_dose = st.number_input(f"2. 请输入单粒/单剂的【原料投料量】 (单位已自动锁定为: {current_unit})", min_value=0.0, step=1.0, value=100.0)
